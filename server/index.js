@@ -8,7 +8,7 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: ['http://localhost:3000', 'https://pixel-canvas-client-tan.vercel.app'] }));
 app.use(express.json());
 
 const pool = new Pool({
@@ -18,7 +18,7 @@ const pool = new Pool({
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: 'http://localhost:3000', methods: ['GET', 'POST'] }
+  cors: { origin: ['http://localhost:3000', 'https://pixel-canvas-client-tan.vercel.app'], methods: ['GET', 'POST'] }
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'pixelgarden_secret';
