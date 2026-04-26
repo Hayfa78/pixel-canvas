@@ -13,7 +13,7 @@ app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
 const server = http.createServer(app);
@@ -35,6 +35,46 @@ const auth = (req, res, next) => {
 };
 
 const generateCode = () => Math.random().toString(36).substring(2, 10).toUpperCase();
+
+pool.query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS game_type VARCHAR(30) DEFAULT 'pixel_painting'`).catch(console.error);
+pool.query(`CREATE TABLE IF NOT EXISTS game_rounds (
+  id SERIAL PRIMARY KEY,
+  room_id INTEGER REFERENCES rooms(id),
+  round_number INTEGER,
+  true_prompt VARCHAR(200),
+  impostor_prompt VARCHAR(200),
+  status VARCHAR(20) DEFAULT 'waiting',
+  created_at TIMESTAMP DEFAULT NOW()
+)`).catch(console.error);
+
+pool.query(`CREATE TABLE IF NOT EXISTS prompt_games (
+  id SERIAL PRIMARY KEY,
+  canvas_id INTEGER,
+  word VARCHAR(100),
+  status VARCHAR(20) DEFAULT 'drawing',
+  created_at TIMESTAMP DEFAULT NOW()
+)`).catch(console.error);
+
+pool.query(`CREATE TABLE IF NOT EXISTS grow_tiles (
+  id SERIAL PRIMARY KEY,
+  canvas_id INTEGER,
+  x INTEGER,
+  y INTEGER,
+  player_username VARCHAR(100),
+  color VARCHAR(20),
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(canvas_id, x, y)
+)`).catch(console.error);
+
+pool.query(`CREATE TABLE IF NOT EXISTS wordle_scores (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id),
+  word_name VARCHAR(50),
+  guesses_count INTEGER,
+  won BOOLEAN,
+  played_at DATE DEFAULT CURRENT_DATE,
+  UNIQUE(user_id, played_at)
+)`).catch(console.error);
 
 const seedCanvasTiles = async (canvasId) => {
   const values = [];
@@ -175,6 +215,95 @@ app.delete('/canvases/:id/tiles', auth, async (req, res) => {
   }
 });
 
+app.get('/stats', auth, async (req, res) => {
+  try {
+    const [canvasesResult, tilesResult] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM canvases WHERE owner_id = $1', [req.user.id]),
+      pool.query('SELECT COUNT(*) FROM canvas_tiles WHERE owner_id = $1', [req.user.id]),
+    ]);
+    res.json({
+      canvases_count: parseInt(canvasesResult.rows[0].count),
+      tiles_painted: parseInt(tilesResult.rows[0].count),
+      games_played: 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+app.post('/prompt-games', auth, async (req, res) => {
+  const { canvasId, word } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO prompt_games (canvas_id, word) VALUES ($1, $2) RETURNING *',
+      [canvasId, word]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create prompt game' });
+  }
+});
+
+app.get('/prompt-games/:canvasId', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM prompt_games WHERE canvas_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [req.params.canvasId]
+    );
+    res.json(result.rows[0] || null);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch prompt game' });
+  }
+});
+
+app.post('/grow-tiles', auth, async (req, res) => {
+  const { canvasId, x, y, color } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO grow_tiles (canvas_id, x, y, player_username, color)
+       VALUES ($1, $2, $3, $4, $5) ON CONFLICT (canvas_id, x, y) DO NOTHING RETURNING *`,
+      [canvasId, x, y, req.user.username, color]
+    );
+    res.json(result.rows[0] || {});
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save grow tile' });
+  }
+});
+
+app.get('/grow-tiles/:canvasId', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM grow_tiles WHERE canvas_id = $1',
+      [req.params.canvasId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch grow tiles' });
+  }
+});
+
+app.post('/wordle-scores', auth, async (req, res) => {
+  const { wordName, guessesCount, won } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO wordle_scores (user_id, word_name, guesses_count, won)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, played_at) DO UPDATE
+       SET guesses_count = EXCLUDED.guesses_count, won = EXCLUDED.won`,
+      [req.user.id, wordName, guessesCount, won]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save score' });
+  }
+});
+
 app.post('/rooms', auth, async (req, res) => {
   const { canvasId, mode } = req.body;
   try {
@@ -262,6 +391,67 @@ io.on('connection', (socket) => {
     const state = roomStates[roomCode];
     if (state && state.mode === 'battle' && state.currentTurn !== username) return;
     socket.to(roomCode).emit('tile_updated', { x, y, color, username });
+  });
+
+  socket.on('set_prompt_word', ({ roomCode, word }) => {
+    if (!roomStates[roomCode]) return;
+    roomStates[roomCode].promptWord = word;
+    io.to(roomCode).emit('prompt_word_set', { word });
+  });
+
+  socket.on('guess', ({ roomCode, username, text }) => {
+    if (!roomStates[roomCode]) return;
+    const correct = roomStates[roomCode].promptWord &&
+      text.toLowerCase() === roomStates[roomCode].promptWord.toLowerCase();
+    io.to(roomCode).emit('guess_received', { username, text, correct });
+  });
+
+  socket.on('grow_tile', ({ roomCode, x, y, color, username }) => {
+    if (!roomStates[roomCode]) return;
+    if (!roomStates[roomCode].growTiles) roomStates[roomCode].growTiles = {};
+    roomStates[roomCode].growTiles[`${x},${y}`] = { username, color };
+    io.to(roomCode).emit('tile_grown', { x, y, color, username });
+  });
+
+  socket.on('impostor_start', ({ roomCode, truePrompt, impostorPrompt, players }) => {
+    if (!roomStates[roomCode]) return;
+    roomStates[roomCode].impostorPhase = 'drawing';
+    const impostorIdx = Math.floor(Math.random() * players.length);
+    players.forEach((player, idx) => {
+      const prompt = idx === impostorIdx ? impostorPrompt : truePrompt;
+      io.to(roomCode).emit('impostor_assigned', { player, prompt, isImpostor: idx === impostorIdx });
+    });
+  });
+
+  socket.on('player_ready', ({ roomCode, username }) => {
+    if (!roomStates[roomCode]) return;
+    if (!roomStates[roomCode].readyPlayers) roomStates[roomCode].readyPlayers = new Set();
+    roomStates[roomCode].readyPlayers.add(username);
+    const total = roomStates[roomCode].members.length;
+    const ready = roomStates[roomCode].readyPlayers.size;
+    io.to(roomCode).emit('ready_update', { ready, total });
+    if (ready >= total) {
+      roomStates[roomCode].impostorPhase = 'voting';
+      io.to(roomCode).emit('phase_change', { phase: 'voting' });
+    }
+  });
+
+  socket.on('cast_vote', ({ roomCode, voter, target }) => {
+    if (!roomStates[roomCode]) return;
+    if (!roomStates[roomCode].votes) roomStates[roomCode].votes = {};
+    roomStates[roomCode].votes[voter] = target;
+    const total = roomStates[roomCode].members.length;
+    const count = Object.keys(roomStates[roomCode].votes).length;
+    io.to(roomCode).emit('vote_update', { count, total });
+    if (count >= total) {
+      const tallied = {};
+      Object.values(roomStates[roomCode].votes).forEach(v => {
+        tallied[v] = (tallied[v] || 0) + 1;
+      });
+      const mostVoted = Object.entries(tallied).sort((a, b) => b[1] - a[1])[0][0];
+      roomStates[roomCode].impostorPhase = 'results';
+      io.to(roomCode).emit('results', { votes: roomStates[roomCode].votes, tallied, mostVoted });
+    }
   });
 
   socket.on('disconnect', () => {
