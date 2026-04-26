@@ -304,6 +304,22 @@ app.post('/wordle-scores', auth, async (req, res) => {
   }
 });
 
+app.get('/gallery', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.*, u.username as owner_name
+       FROM canvases c
+       JOIN users u ON u.id = c.owner_id
+       ORDER BY c.created_at DESC
+       LIMIT 20`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch gallery' });
+  }
+});
+
 app.post('/rooms', auth, async (req, res) => {
   const { canvasId, mode } = req.body;
   try {
